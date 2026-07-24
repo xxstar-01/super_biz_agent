@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     rag_top_k: int = 3
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
 
+    # 重排 (Rerank) 配置
+    # 流程: 向量检索取 rerank_retrieve_n 篇 → 重排模型精排 → 取前 rerank_top_k 篇
+    rerank_enabled: bool = True
+    rerank_model: str = "gte-rerank-v2"  # 百炼重排模型: gte-rerank-v2 / qwen3-rerank
+    rerank_retrieve_n: int = 10  # 召回阶段获取的候选文档数
+    rerank_top_k: int = 3  # 重排后保留的文档数
+
     # 文档分块配置
     chunk_max_size: int = 800
     chunk_overlap: int = 100
