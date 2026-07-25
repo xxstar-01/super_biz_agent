@@ -1,175 +1,131 @@
-"""文档分割服务模块 - 基于 LangChain 的智能文档分割"""
+"""文档分割服务模块 - 基于处理器注册模式的多类型文档分割
+
+架构说明:
+- 每种文件类型有独立的 DocumentProcessor 处理器（见 processors/ 目录）
+- DocumentSplitterService 是调度中心，根据文件扩展名匹配处理器
+- 通过 ProcessorRegistry 管理扩展名 → 处理器的映射
+- 新增文件类型只需：① 创建处理器类 → ② 注册到 registry
+
+支持的文件类型及分片策略一览:
+
+| 扩展名 | 处理器              | 文本提取           | 分片策略                                |
+|--------|---------------------|--------------------|-----------------------------------------|
+| .md    | MarkdownProcessor   | UTF-8 直接读取     | 标题分割 → 递归字符分割 → 合并小片段    |
+| .txt   | TextProcessor       | UTF-8 直接读取     | 递归字符分割（单阶段）                  |
+| .pdf   | PDFProcessor        | pymupdf 逐页提取   | 按页分割 → 递归字符分割 → 合并小片段    |
+| .docx  | WordProcessor       | python-docx 逐段落 | 递归字符分割（单阶段）                  |
+
+所有处理器统一使用 RecursiveCharacterTextSplitter:
+- chunk_size: 配置值 × 2（默认 1600 字符）
+- chunk_overlap: 配置值（默认 100 字符）
+- 分割优先级: "\n\n" → "\n" → " " → ""（优先在段落边界切割）
+"""
 
 from pathlib import Path
 from typing import List
 
 from langchain_core.documents import Document
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from loguru import logger
 
-from app.config import config
+from app.services.processors import (
+    MarkdownProcessor,
+    PDFProcessor,
+    TextProcessor,
+    WordProcessor,
+    processor_registry,
+)
+
+
+# --- 注册所有处理器 ---
+# 新增文件类型时，在此处添加一行 register() 即可
+processor_registry.register(TextProcessor)
+processor_registry.register(MarkdownProcessor)
+processor_registry.register(PDFProcessor)
+processor_registry.register(WordProcessor)
+# ---
 
 
 class DocumentSplitterService:
-    """文档分割服务 - 使用 LangChain 的分割器"""
+    """文档分割服务 - 处理器调度中心
+
+    根据文件扩展名自动匹配对应的处理器，执行文本提取和分片。
+    保持了原有 API 的向后兼容性。
+    """
 
     def __init__(self):
-        """初始化文档分割服务"""
-        self.chunk_size = config.chunk_max_size
-        self.chunk_overlap = config.chunk_overlap
-
-        # Markdown 标题分割器 (只按一级和二级标题分割，减少分片数)
-        self.markdown_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=[
-                ("#", "h1"),
-                ("##", "h2"),
-                # 不再按三级标题分割，避免过度碎片化
-            ],
-            strip_headers=False,  # 保留标题在内容中
-        )
-
-        # 递归字符分割器 (用于二次分割，使用更大的chunk_size)
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size * 2,  # 加倍chunk_size，减少分片数
-            chunk_overlap=self.chunk_overlap,
-            length_function=len,
-            is_separator_regex=False,
-        )
-
+        self._supported_extensions = processor_registry.get_supported_extensions()
         logger.info(
-            f"文档分割服务初始化完成, chunk_size={self.chunk_size}, "
-            f"secondary_chunk_size={self.chunk_size * 2}, "
-            f"overlap={self.chunk_overlap}"
+            f"文档分割服务初始化完成, "
+            f"支持类型: {self._supported_extensions}"
         )
 
-    def split_markdown(self, content: str, file_path: str = "") -> List[Document]:
-        """
-        分割 Markdown 文档 (两阶段分割 + 合并小片段)
-
-        Args:
-            content: Markdown 内容
-            file_path: 文件路径 (用于元数据)
-
-        Returns:
-            List[Document]: 文档分片列表
-        """
-        if not content or not content.strip():
-            logger.warning(f"Markdown 文档内容为空: {file_path}")
-            return []
-
-        try:
-            # 第一阶段: 按标题分割
-            md_docs = self.markdown_splitter.split_text(content)
-
-            # 第二阶段: 按大小进一步分割
-            docs_after_split = self.text_splitter.split_documents(md_docs)
-
-            # 第三阶段: 合并太小的分片 (< 300字符)
-            final_docs = self._merge_small_chunks(docs_after_split, min_size=300)
-
-            # 添加文件路径元数据
-            for doc in final_docs:
-                doc.metadata["_source"] = file_path
-                doc.metadata["_extension"] = ".md"
-                doc.metadata["_file_name"] = Path(file_path).name
-
-            logger.info(f"Markdown 分割完成: {file_path} -> {len(final_docs)} 个分片")
-            return final_docs
-
-        except Exception as e:
-            logger.error(f"Markdown 分割失败: {file_path}, 错误: {e}")
-            raise
-
-    def split_text(self, content: str, file_path: str = "") -> List[Document]:
-        """
-        分割普通文本文档
-
-        Args:
-            content: 文本内容
-            file_path: 文件路径 (用于元数据)
-
-        Returns:
-            List[Document]: 文档分片列表
-        """
-        if not content or not content.strip():
-            logger.warning(f"文本文档内容为空: {file_path}")
-            return []
-
-        try:
-            # 直接使用递归字符分割器
-            docs = self.text_splitter.create_documents(
-                texts=[content],
-                metadatas=[
-                    {
-                        "_source": file_path,
-                        "_extension": Path(file_path).suffix,
-                        "_file_name": Path(file_path).name,
-                    }
-                ],
-            )
-
-            logger.info(f"文本分割完成: {file_path} -> {len(docs)} 个分片")
-            return docs
-
-        except Exception as e:
-            logger.error(f"文本分割失败: {file_path}, 错误: {e}")
-            raise
+    # ------------------------------------------------------------------
+    # 核心 API
+    # ------------------------------------------------------------------
 
     def split_document(self, content: str, file_path: str = "") -> List[Document]:
         """
-        智能分割文档 (根据文件类型选择分割器)
+        智能分割文档 - 根据文件扩展名自动选择处理器
+
+        这是主要入口。也支持直接传入文件路径，内部会读取文件内容。
 
         Args:
-            content: 文档内容
-            file_path: 文件路径
+            content: 文档文本内容（如果 file_path 为非 md/txt 类型，
+                     此参数可传空字符串，方法会从文件路径自动读取）
+            file_path: 文件路径（用于判断文件类型和提取元数据）
 
         Returns:
             List[Document]: 文档分片列表
         """
-        if file_path.endswith(".md"):
-            return self.split_markdown(content, file_path)
-        else:
+        if not file_path:
+            logger.warning("未提供文件路径，无法判断类型，回退到纯文本处理")
             return self.split_text(content, file_path)
 
-    def _merge_small_chunks(
-        self, documents: List[Document], min_size: int = 300
-    ) -> List[Document]:
-        """
-        合并太小的分片
+        ext = Path(file_path).suffix.lower()
+        processor = processor_registry.get_processor(ext)
 
-        Args:
-            documents: 文档列表
-            min_size: 最小分片大小 (字符数)
+        if processor is None:
+            logger.warning(
+                f"未找到扩展名 '{ext}' 的处理器，回退到纯文本处理"
+            )
+            return self.split_text(content, file_path)
 
-        Returns:
-            List[Document]: 合并后的文档列表
-        """
-        if not documents:
+        # 如果调用方已提供文本内容（如旧代码的 md/txt 流程），
+        # 直接走 split() 避免重复读取文件；否则走完整 process()
+        if content and content.strip():
+            return processor.split(content, file_path)
+        else:
+            return processor.process(file_path)
+
+    # ------------------------------------------------------------------
+    # 向后兼容的便捷方法
+    # ------------------------------------------------------------------
+
+    def split_markdown(self, content: str, file_path: str = "") -> List[Document]:
+        """分割 Markdown 文档（兼容旧 API，委托给 MarkdownProcessor）"""
+        processor = processor_registry.get_processor("md")
+        if processor is None:
             return []
+        return processor.split(content, file_path)
 
-        merged_docs = []
-        current_doc = None
+    def split_text(self, content: str, file_path: str = "") -> List[Document]:
+        """分割纯文本文档（兼容旧 API，委托给 TextProcessor）"""
+        processor = processor_registry.get_processor("txt")
+        if processor is None:
+            return []
+        return processor.split(content, file_path)
 
-        for doc in documents:
-            doc_size = len(doc.page_content)
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
 
-            if current_doc is None:
-                # 第一个文档
-                current_doc = doc
-            elif doc_size < min_size and len(current_doc.page_content) < self.chunk_size * 2:
-                # 当前文档太小且合并后不会太大，则合并
-                current_doc.page_content += "\n\n" + doc.page_content
-                # 保留主文档的元数据
-            else:
-                # 保存当前文档，开始新文档
-                merged_docs.append(current_doc)
-                current_doc = doc
+    def get_supported_extensions(self) -> List[str]:
+        """获取所有支持的文件扩展名"""
+        return self._supported_extensions
 
-        # 添加最后一个文档
-        if current_doc is not None:
-            merged_docs.append(current_doc)
-
-        return merged_docs
+    def get_processor_info(self) -> dict:
+        """获取处理器信息（扩展名 → 类名）"""
+        return processor_registry.get_processor_info()
 
 
 # 全局单例
