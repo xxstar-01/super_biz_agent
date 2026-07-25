@@ -88,7 +88,10 @@ class VectorIndexService:
             result.directory_path = str(dir_path)
 
             # 获取所有支持的文件
-            files = list(dir_path.glob("*.txt")) + list(dir_path.glob("*.md"))
+            supported = document_splitter_service.get_supported_extensions()
+            files = []
+            for ext in supported:
+                files.extend(dir_path.glob(f"*.{ext}"))
 
             if not files:
                 logger.warning(f"目录中没有找到支持的文件: {target_path}")
@@ -147,19 +150,17 @@ class VectorIndexService:
         logger.info(f"开始索引文件: {path}")
 
         try:
-            # 1. 读取文件内容
-            content = path.read_text(encoding="utf-8")
-            logger.info(f"读取文件: {path}, 内容长度: {len(content)} 字符")
-
-            # 2. 删除该文件的旧数据（如果存在）
+            # 1. 删除该文件的旧数据（如果存在）
             normalized_path = path.as_posix()
             vector_store_manager.delete_by_source(normalized_path)
 
-            # 3. 使用新的文档分割器
-            documents = document_splitter_service.split_document(content, normalized_path)
+            # 2. 使用文档分割服务（内部按扩展名匹配处理器，
+            #    文本类处理器直接读取 UTF-8，
+            #    PDF/DOCX 等二进制处理器使用对应库提取文本）
+            documents = document_splitter_service.split_document("", normalized_path)
             logger.info(f"文档分割完成: {file_path} -> {len(documents)} 个分片")
 
-            # 4. 添加文档到向量存储
+            # 3. 添加文档到向量存储
             if documents:
                 vector_store_manager.add_documents(documents)
                 logger.info(f"文件索引完成: {file_path}, 共 {len(documents)} 个分片")
