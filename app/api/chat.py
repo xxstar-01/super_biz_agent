@@ -41,6 +41,10 @@ async def chat(request: ChatRequest):
             session_id=request.id
         )
 
+        # 检查并消费压缩事件
+        compression_summary = rag_agent_service.pop_compression_event(request.id)
+        compressed = compression_summary is not None
+
         logger.info(f"[会话 {request.id}] 快速对话完成")
 
         return {
@@ -49,7 +53,8 @@ async def chat(request: ChatRequest):
             "data": {
                 "success": True,
                 "answer": answer,
-                "errorMessage": None
+                "errorMessage": None,
+                "compressed": compressed,
             }
         }
 
@@ -79,6 +84,10 @@ async def chat_stream(request: ChatRequest):
     内容流式事件:
     event: message
     data: {"type":"content","data":"内容块"}
+
+    上下文压缩事件:
+    event: message
+    data: {"type":"compression","data":"---------上下文已自动压缩---------","summary":"摘要文本"}
 
     完成事件:
     event: message
@@ -134,6 +143,16 @@ async def chat_stream(request: ChatRequest):
                         "data": json.dumps({
                             "type": "content",
                             "data": chunk_data
+                        }, ensure_ascii=False)
+                    }
+                elif chunk_type == "compression":
+                    # 上下文自动压缩通知（前端显示分隔线）
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "compression",
+                            "data": "---------上下文已自动压缩---------",
+                            "summary": chunk_data
                         }, ensure_ascii=False)
                     }
                 elif chunk_type == "complete":

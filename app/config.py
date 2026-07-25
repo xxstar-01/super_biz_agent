@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     rag_top_k: int = 3
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
 
+    # 上下文压缩配置
+    # 当对话历史的 token 数超过 context_compression_window_size * threshold 时，
+    # 自动用大模型将旧消息压缩为摘要，降低 token 消耗
+    context_compression_enabled: bool = True
+    context_compression_window_size: int = 32768  # 模型上下文窗口大小（token），qwen-max 为 32K
+    context_compression_threshold: float = 0.7  # 触发压缩的阈值（占上下文窗口的比例）
+    context_compression_keep_recent: int = 4  # 保留最近 N 轮对话不压缩
+    context_compression_model: str = "qwen-plus"  # 用于生成摘要的模型（可用更便宜的模型）
+
     # 重排 (Rerank) 配置
     # 流程: 向量检索取 rerank_retrieve_n 篇 → 重排模型精排 → 取前 rerank_top_k 篇
     rerank_enabled: bool = True

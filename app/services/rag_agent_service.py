@@ -20,6 +20,7 @@ from typing_extensions import TypedDict
 from langchain_qwq import ChatQwen
 
 from app.config import config
+from app.core.context_compressor import ContextCompressorMiddleware
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.agent.mcp_client import (
     get_mcp_client_with_retry,
@@ -99,6 +100,17 @@ class RagAgentService:
             streaming=streaming,
         )
 
+        # 压缩专用 LLM（非流式，可用更便宜的模型）
+        self.compression_llm = ChatQwen(
+            model=config.context_compression_model,
+            api_key=config.dashscope_api_key,
+            temperature=0.3,  # 摘要需要更稳定
+            streaming=False,
+        )
+
+        # 上下文压缩中间件
+        self.context_compressor = ContextCompressorMiddleware(self.compression_llm)
+
         # 定义基础工具（与 AIOps Planner/Executor 使用同一套默认本地工具）
         self.tools = list(DEFAULT_LOCAL_AGENT_TOOLS)
 
@@ -144,6 +156,7 @@ class RagAgentService:
             self.model,
             tools=all_tools,
             checkpointer=self.checkpointer,
+            middleware=[self.context_compressor],
         )
 
         self._agent_initialized = True
@@ -235,6 +248,14 @@ class RagAgentService:
                     tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
                     logger.info(f"[会话 {session_id}] Agent 调用了工具: {tool_names}")
 
+                # 检查是否发生了上下文压缩（不消费事件，由 API 层消费）
+                if self.context_compressor.has_event(session_id):
+                    logger.info(f"[会话 {session_id}] 本轮对话触发了上下文压缩")
+                    # 在答案前附加压缩通知标记
+                    answer = (
+                        "---------上下文已自动压缩---------\n\n" + answer
+                    )
+
                 logger.info(f"[会话 {session_id}] RAG Agent 查询完成（非流式）")
                 return answer
 
@@ -307,6 +328,15 @@ class RagAgentService:
                                         "data": text_content,
                                         "node": node_name
                                     }
+
+            # 检查是否发生了上下文压缩（在 complete 之前 yield）
+            compression_summary = self.context_compressor.pop_event(session_id)
+            if compression_summary:
+                logger.info(f"[会话 {session_id}] 本轮对话触发了上下文压缩")
+                yield {
+                    "type": "compression",
+                    "data": compression_summary,
+                }
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
             yield {"type": "complete"}
@@ -403,6 +433,23 @@ class RagAgentService:
         except Exception as e:
             logger.error(f"清空会话历史失败: {session_id}, 错误: {e}")
             return False
+
+    def pop_compression_event(self, session_id: str) -> str | None:
+        """获取并消费会话的压缩事件
+
+        每次压缩事件只能被消费一次。用于 API 层获取压缩通知。
+
+        Args:
+            session_id: 会话 ID（即 thread_id）
+
+        Returns:
+            摘要文本，如果没有待消费的事件则返回 None
+        """
+        return self.context_compressor.pop_event(session_id)
+
+    def has_compression_event(self, session_id: str) -> bool:
+        """检查会话是否有待消费的压缩事件（不消费）"""
+        return self.context_compressor.has_event(session_id)
 
     async def cleanup(self):
         """清理资源"""
