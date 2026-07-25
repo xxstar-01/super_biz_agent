@@ -13,8 +13,8 @@ from langchain_core.messages import (
     RemoveMessage,
     SystemMessage,
 )
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
+from app.memory import get_memory_manager
 from loguru import logger
 from typing_extensions import TypedDict
 from langchain_qwq import ChatQwen
@@ -117,8 +117,10 @@ class RagAgentService:
         # MCP 客户端（延迟初始化，使用全局管理）
         self.mcp_tools: list = []
 
-        # 创建内存检查点（用于会话管理）
-        self.checkpointer = MemorySaver()
+        # SQLite 持久化检查点 (L2 会话记忆)
+        # 替代原来的 MemorySaver, 进程重启后会话状态不丢失
+        self.memory_manager = get_memory_manager()
+        self.checkpointer = self.memory_manager.session_store
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
@@ -216,6 +218,13 @@ class RagAgentService:
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
 
+            # L3 情景记忆: 开始记录任务
+            self.memory_manager.start_episode(
+                session_id=session_id,
+                task_input=question,
+                task_type="chat",
+            )
+
             # 构建消息列表（系统提示 + 用户问题）
             messages = [
                 SystemMessage(content=self.system_prompt),
@@ -257,6 +266,14 @@ class RagAgentService:
                     )
 
                 logger.info(f"[会话 {session_id}] RAG Agent 查询完成（非流式）")
+                # L3 情景记忆: 记录任务完成
+                self.memory_manager.complete_episode(
+                    session_id=session_id,
+                    plan=[],
+                    past_steps=[],
+                    response=answer,
+                    status="completed",
+                )
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -266,6 +283,15 @@ class RagAgentService:
             logger.error(
                 f"[会话 {session_id}] RAG Agent 查询失败（非流式）: "
                 f"{format_exception_chain(e)}"
+            )
+            # L3 情景记忆: 记录任务失败
+            self.memory_manager.complete_episode(
+                session_id=session_id,
+                plan=[],
+                past_steps=[],
+                response="",
+                status="failed",
+                error_message=str(e),
             )
             raise
 
@@ -290,6 +316,13 @@ class RagAgentService:
             await self._initialize_agent()
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
+
+            # L3 情景记忆: 开始记录任务
+            self.memory_manager.start_episode(
+                session_id=session_id,
+                task_input=question,
+                task_type="chat",
+            )
 
             # 构建消息列表（系统提示 + 用户问题）
             messages = [
@@ -339,12 +372,29 @@ class RagAgentService:
                 }
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
+            # L3 情景记忆: 记录任务完成
+            self.memory_manager.complete_episode(
+                session_id=session_id,
+                plan=[],
+                past_steps=[],
+                response="(streaming response)",
+                status="completed",
+            )
             yield {"type": "complete"}
 
         except Exception as e:
             detail = format_exception_chain(e)
             logger.error(
                 f"[会话 {session_id}] RAG Agent 查询失败（流式）: {detail}"
+            )
+            # L3 情景记忆: 记录任务失败
+            self.memory_manager.complete_episode(
+                session_id=session_id,
+                plan=[],
+                past_steps=[],
+                response="",
+                status="failed",
+                error_message=detail,
             )
             yield {"type": "error", "data": detail}
 

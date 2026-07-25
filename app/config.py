@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     chunk_max_size: int = 800
     chunk_overlap: int = 100
 
+    # 多层记忆配置
+    # L2 会话记忆 + L3 情景记忆 使用 SQLite 持久化
+    memory_db_path: str = "data/memory.db"
+    memory_session_expiry_days: int = 7  # 会话过期天数, 超期自动清理
+    memory_episodic_enabled: bool = True  # 是否启用 L3 情景记忆
+    memory_vector_search_enabled: bool = True  # L3 向量检索 (Milvus), 关闭时回退到关键词匹配
+    memory_semantic_enabled: bool = True  # L4 语义记忆: 成功任务自动提取经验写入 Milvus
+    memory_semantic_model: str = "qwen-plus"  # L4 经验提取使用的 LLM 模型
+
     # MCP 服务配置（transport: stdio | sse | streamable-http）
     # 腾讯云托管 MCP 的 URL 通常含 /sse/，需使用 sse；本地 FastMCP 使用 streamable-http
     mcp_cls_transport: str = "streamable-http"

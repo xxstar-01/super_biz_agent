@@ -1,14 +1,17 @@
 """
 通用 Plan-Execute-Replan 服务
 基于 LangGraph 官方教程实现
+
+L2 会话记忆: SqliteSaver 持久化 checkpoint
+L3 情景记忆: EpisodeStore 记录任务历史
 """
 
 from typing import AsyncGenerator, Dict, Any
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 from loguru import logger
 
 from app.agent.aiops import PlanExecuteState, planner, executor, replanner
+from app.memory import get_memory_manager
 
 
 # 节点名称常量
@@ -18,13 +21,36 @@ NODE_REPLANNER = "replanner"
 
 
 class AIOpsService:
-    """通用 Plan-Execute-Replan 服务"""
+    """通用 Plan-Execute-Replan 服务 (带持久化记忆)"""
 
     def __init__(self):
-        """初始化服务"""
-        self.checkpointer = MemorySaver()
-        self.graph = self._build_graph()
-        logger.info("Plan-Execute-Replan Service 初始化完成")
+        """初始化服务 - 延迟加载 checkpointer 和 graph"""
+        self._checkpointer = None
+        self._graph = None
+        self._memory_manager = None
+        logger.info("AIOpsService 实例已创建 (延迟初始化)")
+
+    @property
+    def memory_manager(self):
+        """延迟获取 MemoryManager (首次访问时创建)"""
+        if self._memory_manager is None:
+            self._memory_manager = get_memory_manager()
+        return self._memory_manager
+
+    @property
+    def checkpointer(self):
+        """延迟获取 SqliteSaver (L2 会话记忆)"""
+        if self._checkpointer is None:
+            self._checkpointer = self.memory_manager.session_store
+        return self._checkpointer
+
+    @property
+    def graph(self):
+        """延迟构建 LangGraph 工作流"""
+        if self._graph is None:
+            self._graph = self._build_graph()
+            logger.info("Plan-Execute-Replan 工作流图构建完成")
+        return self._graph
 
     def _build_graph(self):
         """构建 Plan-Execute-Replan 工作流"""
@@ -48,18 +74,15 @@ class AIOpsService:
         # replanner 的条件边
         def should_continue(state: PlanExecuteState) -> str:
             """判断是否继续执行"""
-            # 如果已经生成了最终响应，结束
             if state.get("response"):
                 logger.info("已生成最终响应，结束流程")
                 return END
 
-            # 如果还有计划步骤，继续执行
             plan = state.get("plan", [])
             if plan:
                 logger.info(f"继续执行，剩余 {len(plan)} 个步骤")
                 return NODE_EXECUTOR
 
-            # 计划为空但没有响应，返回 replanner 生成响应
             logger.info("计划执行完毕，生成最终响应")
             return END
 
@@ -72,10 +95,8 @@ class AIOpsService:
             }
         )
 
-        # 编译工作流
+        # 编译工作流 (checkpointer 会在首次访问 graph 属性时注入)
         compiled_graph = workflow.compile(checkpointer=self.checkpointer)
-
-        logger.info("工作流图构建完成")
         return compiled_graph
 
     async def execute(
@@ -94,6 +115,16 @@ class AIOpsService:
             Dict[str, Any]: 流式事件
         """
         logger.info(f"[会话 {session_id}] 开始执行任务: {user_input}")
+
+        # L3 情景记忆: 开始记录任务
+        self.memory_manager.start_episode(
+            session_id=session_id,
+            task_input=user_input,
+            task_type="aiops",
+        )
+
+        # 捕获初始计划 (Planner 输出)
+        original_plan: list[str] = []
 
         try:
             # 初始化状态
@@ -120,8 +151,15 @@ class AIOpsService:
                 for node_name, node_output in event.items():
                     logger.info(f"节点 '{node_name}' 输出事件")
 
-                    # 根据节点类型生成不同的事件
+                    # 捕获 Planner 输出的初始计划
                     if node_name == NODE_PLANNER:
+                        plan_from_output = node_output.get("plan", [])
+                        if plan_from_output and not original_plan:
+                            original_plan = list(plan_from_output)
+                            # L3: 更新 episode 计划
+                            self.memory_manager.update_episode_plan(
+                                session_id, original_plan
+                            )
                         yield self._format_planner_event(node_output)
 
                     elif node_name == NODE_EXECUTOR:
@@ -133,10 +171,20 @@ class AIOpsService:
             # 获取最终状态
             final_state = self.graph.get_state(config_dict)
             final_response = ""
+            final_past_steps: list[tuple] = []
 
-            # 安全地获取响应（处理 values 可能为 None 的情况）
             if final_state and final_state.values:
                 final_response = final_state.values.get("response", "")
+                final_past_steps = final_state.values.get("past_steps", [])
+
+            # L3 情景记忆: 记录任务完成
+            self.memory_manager.complete_episode(
+                session_id=session_id,
+                plan=original_plan,
+                past_steps=final_past_steps,
+                response=final_response,
+                status="completed",
+            )
 
             # 发送完成事件
             yield {
@@ -150,6 +198,17 @@ class AIOpsService:
 
         except Exception as e:
             logger.error(f"[会话 {session_id}] 任务执行失败: {e}", exc_info=True)
+
+            # L3 情景记忆: 记录任务失败
+            self.memory_manager.complete_episode(
+                session_id=session_id,
+                plan=original_plan,
+                past_steps=[],
+                response="",
+                status="failed",
+                error_message=str(e),
+            )
+
             yield {
                 "type": "error",
                 "stage": "error",
@@ -169,7 +228,6 @@ class AIOpsService:
         Yields:
             Dict[str, Any]: 诊断过程的流式事件
         """
-        # 使用固定的 AIOps 任务描述
         from textwrap import dedent
         aiops_task = dedent("""诊断当前系统是否存在告警，如果存在告警请详细分析告警原因并生成诊断报告，诊断报告输出格式要求：
                 ```
@@ -248,7 +306,6 @@ class AIOpsService:
         async for event in self.execute(aiops_task, session_id):
             # 转换事件格式以兼容旧的 API
             if event.get("type") == "complete":
-                # 将 response 包装为 diagnosis 格式
                 yield {
                     "type": "complete",
                     "stage": "diagnosis_complete",
@@ -320,7 +377,6 @@ class AIOpsService:
         plan = state.get("plan", [])
 
         if response:
-            # 已生成最终响应
             return {
                 "type": "report",
                 "stage": "final_report",
@@ -328,7 +384,6 @@ class AIOpsService:
                 "report": response
             }
         else:
-            # 重新规划
             return {
                 "type": "status",
                 "stage": "replanner",

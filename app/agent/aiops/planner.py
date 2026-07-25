@@ -13,6 +13,7 @@ from loguru import logger
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.memory import get_memory_manager
 from .state import PlanExecuteState
 from .utils import format_tools_description
 
@@ -104,21 +105,37 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
         # 格式化工具描述
         tools_description = format_tools_description(all_tools)
 
-        # 步骤3: 格式化经验文档上下文
-        if experience_docs:
-            experience_context = dedent(f"""
-                ## 相关经验文档
+        # 步骤3: 获取 L3 情景记忆中的历史任务经验
+        l3_experience = ""
+        try:
+            memory_manager = get_memory_manager()
+            l3_experience = memory_manager.get_experience_context(input_text)
+            if l3_experience:
+                logger.info(f"找到 L3 历史任务经验，长度: {len(l3_experience)}")
+        except Exception as e:
+            logger.warning(f"查询 L3 历史经验失败: {e}")
 
-                以下是从知识库中检索到的相关经验和最佳实践，请参考这些经验制定执行计划：
+        # 步骤4: 格式化经验文档上下文 (L4 + L3)
+        experience_parts = []
+        if experience_docs:
+            experience_parts.append(
+                dedent(f"""
+                ## 知识库经验 (L4 语义记忆)
+
+                以下是从知识库中检索到的相关经验和最佳实践：
 
                 {experience_docs}
+                """).strip()
+            )
+        if l3_experience:
+            experience_parts.append(l3_experience)
 
-                ---
-            """).strip()
+        if experience_parts:
+            experience_context = "\n\n---\n\n".join(experience_parts)
         else:
             experience_context = ""
 
-        # 步骤4: 创建 LLM 并生成计划
+        # 步骤5: 创建 LLM 并生成计划
         llm = ChatQwen(
             model=config.rag_model,
             api_key=config.dashscope_api_key,
